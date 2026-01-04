@@ -12,6 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer, LTChar
+import fitz  # PyMuPDF
 
 # --- Configuration & Setup ---
 load_dotenv()
@@ -82,6 +83,41 @@ def detect_layout(pdf_path: Path) -> bool:
         logger.warning(f"   -> Error en detección: {e}. Asumiendo 1 columna.")
         return False
 
+# --- 1.5 Cover Generation ---
+def generate_cover_page(pdf_path: Path) -> Path:
+    """
+    Generates a PDF cover page from the first page of the original PDF.
+    Renders the first page as an image and saves it as a new PDF.
+    """
+    logger.info(f"🖼️  Generando portada para: {pdf_path.name}")
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc.load_page(0)  # First page
+        
+        # Render page to an image (pixmap)
+        # zoom=2 for better resolution (approx 150 dpi which is good for Kindle)
+        mat = fitz.Matrix(2, 2)
+        pix = page.get_pixmap(matrix=mat)
+        
+        # Create a new PDF for the cover
+        cover_pdf_path = PAPERS_KINDLE_DIR / f"{pdf_path.stem}_cover_temp.pdf"
+        cover_doc = fitz.open()
+        cover_page = cover_doc.new_page(width=pix.width, height=pix.height)
+        
+        # Insert the image into the new PDF page
+        cover_page.insert_image(cover_page.rect, stream=pix.tobytes(), keep_proportion=True)
+        
+        cover_doc.save(cover_pdf_path)
+        cover_doc.close()
+        doc.close()
+        
+        logger.info("   -> Portada generada exitosamente.")
+        return cover_pdf_path
+        
+    except Exception as e:
+        logger.error(f"   -> Falló la generación de portada: {e}")
+        return None
+
 # --- 2. Conversion Engine ---
 def convert_paper(pdf_path: Path, is_two_column: bool) -> Path:
     """
@@ -130,33 +166,62 @@ def convert_paper(pdf_path: Path, is_two_column: bool) -> Path:
     cmd.append(str(pdf_path))
     
     try:
+        # --- Generate Cover First ---
+        cover_path = generate_cover_page(pdf_path)
+        
+        # --- Run k2pdfopt ---
+        # Rename output for k2pdfopt to be a temp file
+        body_output_filename = f"{safe_stem}_body_temp.pdf"
+        body_output_path = PAPERS_KINDLE_DIR / body_output_filename
+        
         # Ensure k2pdfopt is executable
         if not os.access(K2PDFOPT_PATH, os.X_OK):
              logger.warning("   -> k2pdfopt no es ejecutable. Intentando chmod +x...")
              os.chmod(K2PDFOPT_PATH, 0o755)
 
+        # Update command output path
+        cmd_index = cmd.index("-o") + 1
+        cmd[cmd_index] = str(body_output_path)
+
         logger.debug(f"   Running command: {' '.join(cmd)}")
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
-        # Check if output file exists regardless of return code, 
-        # sometimes k2pdfopt output might vary but file is created.
-        if output_path.exists():
-            file_size_mb = output_path.stat().st_size / (1024 * 1024)
-            logger.info(f"   ✅ Conversión exitosa: {output_filename} ({file_size_mb:.2f} MB)")
-            return output_path
-            
-        if result.returncode != 0:
-            logger.error(f"   -> Falló la conversión. Log:\n{result.stdout}")
-            raise RuntimeError("k2pdfopt failed")
-            
-        logger.error("   -> El archivo de salida no se creó (aunque k2pdfopt retornó 0).")
-        logger.error(f"   -> Esperado: {output_path}")
-        # List directory content to see what happened
-        logger.error(f"   -> Contenido de {PAPERS_KINDLE_DIR}: {[f.name for f in PAPERS_KINDLE_DIR.glob('*.pdf')]}")
-        raise FileNotFoundError(f"Output file not found: {output_path}")
+        if not body_output_path.exists():
+            if result.returncode != 0:
+                logger.error(f"   -> Falló la conversión. Log:\n{result.stdout}")
+                raise RuntimeError("k2pdfopt failed")
+            logger.error("   -> El archivo de salida de cuerpo no se creó.")
+            raise FileNotFoundError(f"Output file not found: {body_output_path}")
+
+        # --- Merge Cover + Body ---
+        logger.info("   🔗 Fusionando portada y contenido...")
+        final_doc = fitz.open()
+        
+        if cover_path and cover_path.exists():
+            final_doc.insert_pdf(fitz.open(cover_path))
+        
+        final_doc.insert_pdf(fitz.open(body_output_path))
+        
+        final_doc.save(output_path)
+        final_doc.close()
+        
+        # Cleanup temps
+        if cover_path and cover_path.exists():
+            os.remove(cover_path)
+        if body_output_path.exists():
+            os.remove(body_output_path)
+
+        file_size_mb = output_path.stat().st_size / (1024 * 1024)
+        logger.info(f"   ✅ Conversión exitosa (con portada): {output_filename} ({file_size_mb:.2f} MB)")
+        return output_path
 
     except Exception as e:
         logger.error(f"   -> Error crítico en conversión: {e}")
+        # Cleanup attempts
+        try:
+             if 'cover_path' in locals() and cover_path and cover_path.exists(): os.remove(cover_path)
+             if 'body_output_path' in locals() and body_output_path.exists(): os.remove(body_output_path)
+        except: pass
         raise
 
 # --- 3. Delivery System ---

@@ -1,2 +1,4 @@
 pdfminer.six
 python-dotenv
+
+pymupdf
